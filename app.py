@@ -1,134 +1,282 @@
-# app.py
-# -*- coding: utf-8 -*-
-import os, sys, hashlib, datetime
+import os
+import re
+import time
+import uuid
+import datetime
+import mimetypes
+from typing import Optional
+
 from flask import Flask, request, abort
+from google.cloud import storage
+
+# v2：收訊息/抓內容/回覆
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
     MessageEvent,
     ImageMessage,
-    SourceUser, SourceGroup, SourceRoom,
+    FileMessage,
+    TextMessage,
+    StickerMessage,
     TextSendMessage,
+)
+
+# v3：查群組名稱（群組摘要）
+from linebot.v3.messaging import (
+    Configuration as V3Configuration,
+    ApiClient as V3ApiClient,
+    MessagingApi as V3MessagingApi,
 )
 
 from config import CHANNEL_ACCESS_TOKEN, CHANNEL_SECRET, BASE_DIR
 
-# ------------------------------
-# Flask & LINE 初始化
-# ------------------------------
+# -------------------- 基本設定 --------------------
 app = Flask(__name__)
+
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# 健康檢查（給 ngrok 或監控用）
+# v3：查群組名稱
+_v3_cfg = V3Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+_v3_client = V3ApiClient(_v3_cfg)
+_v3_msg_api = V3MessagingApi(_v3_client)
+
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# GCS 設定
+GCS_BUCKET = os.getenv("GCS_BUCKET")
+_gcs_client: Optional[storage.Client] = None
+
+def _get_gcs_client() -> storage.Client:
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = storage.Client()
+    return _gcs_client
+
+# -------------------- 健康檢查 --------------------
 @app.get("/health")
 def health():
     return "OK", 200
 
-# 確保根資料夾存在
-os.makedirs(BASE_DIR, exist_ok=True)
-
-# 請求簡易日誌
-@app.before_request
-def _log_req():
-    print(f"[REQ] {request.method} {request.path}", file=sys.stdout, flush=True)
-
-# Webhook 入口
+# -------------------- Webhook 入口 --------------------
 @app.post("/callback")
 def callback():
     signature = request.headers.get("X-Line-Signature")
     if not signature:
-        print("[ERR] missing X-Line-Signature", file=sys.stdout, flush=True)
         abort(400)
 
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        print("[ERR] invalid signature", file=sys.stdout, flush=True)
         abort(400)
     except Exception as e:
-        print(f"[ERR] handler exception: {e}", file=sys.stdout, flush=True)
-        # 回 200 告知 LINE 我們已收下，避免重送
-        return "OK"
+        print(f"[ERR] handler exception: {e}", flush=True)
     return "OK"
 
-# ------------------------------
-# 工具：安全回覆（避免 reply token 失效）
-# ------------------------------
-def reply_safely(event, message):
-    """優先 reply，失敗再依來源改用 push（群組/多人/個人）"""
-    try:
-        line_bot_api.reply_message(event.reply_token, message)
-        return
-    except LineBotApiError as e:
-        print(f"[WARN] reply failed: {e}", file=sys.stdout, flush=True)
+# -------------------- 群組名稱快取 --------------------
+_SAFE_PAT = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+SAFE_NAME_MAXLEN = 60
 
-    try:
-        if isinstance(event.source, SourceGroup):
-            line_bot_api.push_message(event.source.group_id, message)
-        elif isinstance(event.source, SourceRoom):
-            line_bot_api.push_message(event.source.room_id, message)
-        elif isinstance(event.source, SourceUser):
-            line_bot_api.push_message(event.source.user_id, message)
-    except LineBotApiError as e:
-        print(f"[ERR] push failed: {e}", file=sys.stdout, flush=True)
+def sanitize_folder_name(name: str) -> str:
+    if not name:
+        return "unknown"
+    name = _SAFE_PAT.sub("_", name).strip().strip(".")
+    if not name:
+        name = "unknown"
+    if len(name) > SAFE_NAME_MAXLEN:
+        name = name[:SAFE_NAME_MAXLEN].rstrip()
+    return name
 
-# ------------------------------
-# 只處理「圖片」訊息：存檔 + 回覆「已存檔」
-# （文字/貼圖/其他一律不回，符合“偵測到圖片才說話”）
-# ------------------------------
+_GROUP_NAME_CACHE: dict[str, tuple[str, float]] = {}
+GROUP_NAME_TTL_SEC = 6 * 60 * 60
+
+def get_group_name_with_cache(group_id: str) -> Optional[str]:
+    now = time.time()
+    cached = _GROUP_NAME_CACHE.get(group_id)
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        summary = _v3_msg_api.get_group_summary(group_id)
+        raw = getattr(summary, "group_name", None) or getattr(summary, "groupName", None)
+        name = sanitize_folder_name(raw or "")
+        _GROUP_NAME_CACHE[group_id] = (name, now + GROUP_NAME_TTL_SEC)
+        return name
+    except Exception as e:
+        print(f"[WARN] get_group_summary failed for {group_id}: {e}", flush=True)
+        return None
+
+# -------------------- 儲存路徑 --------------------
+def _source_folder(event) -> str:
+    st = event.source.type
+    if st == "group":
+        gid = event.source.group_id
+        gname = get_group_name_with_cache(gid)
+        return gname if gname else f"group_{gid}"
+    elif st == "room":
+        return f"room_{event.source.room_id}"
+    else:
+        return f"user_{event.source.user_id}"
+
+def _album_dir(image_set) -> str:
+    if image_set and getattr(image_set, "id", None):
+        return f"album_{image_set.id}"
+    return ""
+
+def _build_dir(event, album_subdir: str) -> str:
+    date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    who = _source_folder(event)
+    parts = [BASE_DIR, date_str, who]
+    if album_subdir:
+        parts.append(album_subdir)
+    dir_path = os.path.join(*parts)
+    os.makedirs(dir_path, exist_ok=True)
+    return dir_path
+
+def _save_bytes(dir_path: str, filename: str, data: bytes) -> str:
+    file_path = os.path.join(dir_path, filename)
+    with open(file_path, "wb") as f:
+        f.write(data)
+    print(f"✅ 已存圖: {file_path}", flush=True)
+    return file_path
+
+def _to_gcs_rel_path(local_file_path: str) -> str:
+    base = os.path.abspath(BASE_DIR)
+    abs_path = os.path.abspath(local_file_path)
+    rel = os.path.relpath(abs_path, base)
+    return rel.replace("\\", "/")
+
+# -------------------- GCS 上傳工具 --------------------
+def upload_to_gcs(local_path: str, rel_path_in_bucket: str) -> str:
+    if not GCS_BUCKET:
+        raise RuntimeError("GCS_BUCKET is not set")
+    client = _get_gcs_client()
+    bucket = client.bucket(GCS_BUCKET)
+    blob = bucket.blob(rel_path_in_bucket)
+    blob.upload_from_filename(local_path)
+    return f"gs://{GCS_BUCKET}/{rel_path_in_bucket}"
+
+def gcs_signed_url(rel_path_in_bucket: str, ttl_seconds: int = 3600) -> str:
+    client = _get_gcs_client()
+    bucket = client.bucket(GCS_BUCKET)
+    blob = bucket.blob(rel_path_in_bucket)
+    url = blob.generate_signed_url(
+        expiration=datetime.timedelta(seconds=ttl_seconds),
+        method="GET",
+    )
+    return url
+
+def after_save_hook(file_path: str) -> Optional[str]:
+    try:
+        if not GCS_BUCKET:
+            return None
+        rel = _to_gcs_rel_path(file_path)
+        gs_uri = upload_to_gcs(file_path, rel)
+        url = gcs_signed_url(rel, ttl_seconds=3600)
+        print(f"☁️ Uploaded to {gs_uri}", flush=True)
+        print(f"🔗 Signed URL (1h): {url}", flush=True)
+        return url
+    except Exception as e:
+        print(f"[WARN] after_save_hook failed: {e}", flush=True)
+        return None
+
+# -------------------- 圖片訊息 --------------------
 @handler.add(MessageEvent, message=ImageMessage)
-def handle_image_message(event):
-    # 取得圖片位元組
+def on_image(event: MessageEvent):
+    cp = getattr(event.message, "content_provider", None)
+    if cp and getattr(cp, "type", "") != "line":
+        print("[INFO] non-line image, skip", flush=True)
+        return
+
     try:
         content = line_bot_api.get_message_content(event.message.id)
-        img_data = content.content
+        img_bytes = content.content
+        ctype = getattr(content, "content_type", None)
+        ext = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+        }.get(ctype, ".jpg")
     except LineBotApiError as e:
-        print(f"[ERR] get_message_content error: {e}", file=sys.stdout, flush=True)
+        print(f"[ERR] get_message_content(Image) failed: {e}", flush=True)
         return
 
-    # 來源資訊（用於分門別類存檔）
-    # user_XXX / group_XXX / room_XXX
-    subdir = "unknown"
-    if isinstance(event.source, SourceUser):
-        subdir = f"user_{event.source.user_id}"
-    elif isinstance(event.source, SourceGroup):
-        subdir = f"group_{event.source.group_id}"
-    elif isinstance(event.source, SourceRoom):
-        subdir = f"room_{event.source.room_id}"
+    iset = getattr(event.message, "image_set", None)
+    album_subdir = _album_dir(iset)
+    dir_path = _build_dir(event, album_subdir)
 
-    # 以日期建立資料夾
-    date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    save_dir = os.path.join(BASE_DIR, date_str, subdir)
-    os.makedirs(save_dir, exist_ok=True)
+    if iset and getattr(iset, "index", None) and getattr(iset, "total", None):
+        index = int(iset.index)
+        total = int(iset.total)
+        filename = f"{index:03d}{ext}"
+        is_album = True
+    else:
+        ts = datetime.datetime.now().strftime("%H%M%S_%f")
+        filename = f"{ts}_{uuid.uuid4().hex[:6]}{ext}"
+        is_album = False
+        total = 1
+        index = 1
 
-    # 檔名：時間戳 + SHA1 前 8 碼（即使重複也會重新存檔，不覆蓋）
-    sha1 = hashlib.sha1(img_data).hexdigest()[:8]
-    ts = datetime.datetime.now().strftime("%H%M%S_%f")
-    filename = f"{ts}_{sha1}.jpg"
-    file_path = os.path.join(save_dir, filename)
+    file_path = _save_bytes(dir_path, filename, img_bytes)
+    signed_url = after_save_hook(file_path)
+
+    reply_text = "✅ 已存檔"
+    if signed_url:
+        reply_text += f"\n{signed_url}"
 
     try:
-        with open(file_path, "wb") as f:
-            f.write(img_data)
-        print(f"✅ 已存圖: {file_path}", file=sys.stdout, flush=True)
+        if is_album:
+            if index == total:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text=f"{reply_text}（相簿/連拍，共 {total} 張）")
+                )
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
     except Exception as e:
-        print(f"[ERR] save file failed: {e}", file=sys.stdout, flush=True)
+        print(f"[WARN] reply skipped: {e}", flush=True)
+
+# -------------------- 檔案訊息（僅圖片） --------------------
+@handler.add(MessageEvent, message=FileMessage)
+def on_file(event: MessageEvent):
+    name = event.message.file_name
+    mime = event.message.mime_type or mimetypes.guess_type(name)[0]
+    if not (mime and mime.startswith("image/")):
+        print(f"[SKIP] 非圖片檔案 {name} ({mime})", flush=True)
         return
 
-    # 只在收到圖片時回一句話（個人/群組/多人都行）
-    reply_safely(event, TextSendMessage(text="✅ 已存檔"))
+    try:
+        content = line_bot_api.get_message_content(event.message.id)
+        img_bytes = content.content
+        ext = mimetypes.guess_extension(mime) or ".jpg"
+    except LineBotApiError as e:
+        print(f"[ERR] get_message_content(File) failed: {e}", flush=True)
+        return
 
-# ------------------------------
-# 其他訊息（文字/貼圖/檔案…）不回覆
-# 若未來要加邏輯，可在這裡擴充
-# ------------------------------
-# 例：什麼都不做 -> 只要不註冊 TextMessage/StickerMessage handler 就不會回
+    dir_path = _build_dir(event, album_subdir="")
+    filename = sanitize_folder_name(os.path.splitext(name)[0]) + ext
+    file_path = _save_bytes(dir_path, filename, img_bytes)
+    signed_url = after_save_hook(file_path)
 
-# ------------------------------
-# 啟動
-# ------------------------------
+    reply_text = "✅ 已存檔"
+    if signed_url:
+        reply_text += f"\n{signed_url}"
+
+    try:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+    except Exception as e:
+        print(f"[WARN] reply skipped: {e}", flush=True)
+
+# -------------------- 文字/貼圖：不回覆 --------------------
+@handler.add(MessageEvent, message=TextMessage)
+def on_text(event: MessageEvent):
+    print("[INFO] text received (silenced).", flush=True)
+
+@handler.add(MessageEvent, message=StickerMessage)
+def on_sticker(event: MessageEvent):
+    print("[INFO] sticker received (silenced).", flush=True)
+
+# -------------------- 入口 --------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))   # Railway 會塞 PORT
+    port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
