@@ -1,4 +1,4 @@
-Flask
+Flask==3.0.3
 line-bot-sdk==3.7.0
-google-cloud-storage>=2.17.0
-gunicorn>=21.2.0
+google-cloud-storage==2.17.0
+gunicorn==23.0.0
