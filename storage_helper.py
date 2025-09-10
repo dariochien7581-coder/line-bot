@@ -13,4 +13,5 @@ def save_bytes(content: Union[bytes, bytearray], rel_path: str) -> str:
     bucket = _storage_client.bucket(GCS_BUCKET)
     blob = bucket.blob(rel_path)
     blob.upload_from_string(bytes(content))
-    return f"gs://{GCS_BUCKET}/{rel_path}"
+    # 回傳公開可用的 URL（需要 bucket 設定允許 public read）
+    return f"https://storage.googleapis.com/{GCS_BUCKET}/{rel_path}"
