@@ -1,18 +1,21 @@
-# 使用 Python 官方輕量版本
-FROM python:3.10-slim
+# 使用輕量 Python 映像
+FROM python:3.12-slim
 
-# 設定容器內的工作目錄
+# 讓 Python 輸出不緩衝，方便看日誌
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
 
-# 複製需求套件並安裝
+# 先裝依賴
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 複製專案所有檔案進容器
+# 複製專案程式
 COPY . .
 
-# Cloud Run 預設會提供環境變數 PORT
-ENV PORT=8000
+# Cloud Run 會把對外埠號放在 $PORT
+ENV PORT=8080
 
-# 啟動 Flask 伺服器
-CMD ["python", "app.py"]
+# 使用 gunicorn 對外服務（app.py 內的 Flask 物件名為 app）
+CMD exec gunicorn --bind :$PORT --workers 2 --threads 4 --timeout 0 app:app
