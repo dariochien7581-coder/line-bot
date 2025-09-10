@@ -1,5 +1,11 @@
-venv/
+.vscode/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+.git/
+.gitignore
 .DS_Store
-*.zip
