@@ -6,6 +6,9 @@ import datetime
 import mimetypes
 from typing import Optional
 
+from flask import Flask
+app = Flask(__name__)
+
 from flask import Flask, request, abort
 from google.cloud import storage
 
