@@ -1,4 +1,9 @@
 Flask==3.0.3
-line-bot-sdk==3.7.0
+gunicorn==21.2.0
+
+# LINE Messaging API (含 v2/v3)
+line-bot-sdk==3.11.0
+
+# Google Cloud Storage
 google-cloud-storage==2.17.0
-gunicorn==23.0.0
+google-auth==2.34.0
