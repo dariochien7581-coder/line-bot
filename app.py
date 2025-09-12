@@ -279,6 +279,105 @@ def on_text(event: MessageEvent):
 def on_sticker(event: MessageEvent):
     print("[INFO] sticker received (silenced).", flush=True)
 
+# =============== 取圖 API / 圖庫頁面（方式 C） ===============
+from flask import jsonify, render_template
+
+API_KEY = os.getenv("API_KEY", "")  # 在 Cloud Run 設定
+
+def _auth_ok(req) -> bool:
+    # 允許用 Header：X-API-Key 或 query：?key=
+    k = req.headers.get("X-API-Key") or req.args.get("key")
+    return bool(API_KEY) and (k == API_KEY)
+
+def _list_prefixes_and_blobs(prefix: str):
+    """回傳 (資料夾清單, 檔案清單)。使用 GCS delimiter 模擬資料夾。"""
+    client = _get_gcs_client()
+    bucket = client.bucket(GCS_BUCKET)
+
+    iterator = client.list_blobs(
+        GCS_BUCKET,
+        prefix=prefix if prefix.endswith("/") else prefix + "/",
+        delimiter="/",
+    )
+    folders = []
+    files = []
+
+    # 需要先消耗 iterator 才會有 prefixes
+    for b in iterator:
+        files.append(b)
+
+    folders = list(iterator.prefixes)  # e.g. ['base/2025-09-11/groupA/', ...]
+
+    return folders, files
+
+@app.get("/api/groups")
+def api_groups():
+    if not _auth_ok(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    date = request.args.get("date")  # YYYY-MM-DD
+    if not date:
+        return jsonify({"error": "missing 'date' (YYYY-MM-DD)"}), 400
+    if not GCS_BUCKET:
+        return jsonify({"error": "GCS_BUCKET not configured"}), 500
+
+    # 結構: BASE_DIR/<date>/<group>/...
+    date_prefix = f"{BASE_DIR}/{date}"
+    folders, _ = _list_prefixes_and_blobs(date_prefix)
+
+    groups = []
+    for p in folders:
+        # p 例： 'line-bot/2025-09-11/數學群組/'
+        tail = p.rstrip("/").split("/")  # ['line-bot','2025-09-11','數學群組']
+        if len(tail) >= 3:
+            groups.append(tail[-1])
+
+    groups = sorted(set(groups))
+    return jsonify({"date": date, "groups": groups})
+
+@app.get("/api/files")
+def api_files():
+    if not _auth_ok(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    date = request.args.get("date")
+    group = request.args.get("group")
+    if not date or not group:
+        return jsonify({"error": "missing 'date' or 'group'"}), 400
+    if not GCS_BUCKET:
+        return jsonify({"error": "GCS_BUCKET not configured"}), 500
+
+    # 支援是否包含相簿子資料夾（若你有 album_xxx）
+    album = request.args.get("album", "")
+    base_prefix = f"{BASE_DIR}/{date}/{group}"
+    prefix = f"{base_prefix}/{album}" if album else base_prefix
+
+    _, files = _list_prefixes_and_blobs(prefix)
+
+    items = []
+    for b in files:
+        # b.name e.g. 'line-bot/2025-09-11/數學群組/001.jpg'
+        rel = b.name  # 就當作 bucket 內相對路徑
+        url = gcs_signed_url(rel, ttl_seconds=86400)  # 24h
+        items.append({
+            "name": os.path.basename(rel),
+            "path": rel,
+            "url": url,
+            "gs_uri": f"gs://{GCS_BUCKET}/{rel}",
+            "size": b.size,
+            "updated": b.updated.isoformat() if getattr(b, "updated", None) else None,
+        })
+
+    # 依檔名排序（有 001.jpg、002.jpg 會很順）
+    items.sort(key=lambda x: x["name"])
+    return jsonify({"date": date, "group": group, "count": len(items), "items": items})
+
+# 圖庫頁面
+@app.get("/gallery")
+def gallery():
+    # 用前端輸入 API Key，後端不擋
+    return render_template("gallery.html", bucket=GCS_BUCKET, base_dir=BASE_DIR)
+
 # -------------------- 入口 --------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
