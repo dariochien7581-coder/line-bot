@@ -322,7 +322,7 @@ def api_groups():
         return jsonify({"error": "GCS_BUCKET not configured"}), 500
 
     # 結構: BASE_DIR/<date>/<group>/...
-    date_prefix = f"{BASE_DIR}/{date}"
+    date_prefix = f"{date}"   # 2025-09-12
     folders, _ = _list_prefixes_and_blobs(date_prefix)
 
     groups = []
