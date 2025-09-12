@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>圖片圖庫</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system; margin: 20px; }
+    .row { display:flex; gap:8px; flex-wrap: wrap; align-items: flex-end; }
+    label { font-size: 14px; color:#444 }
+    input, select, button { padding:8px; font-size:14px; }
+    .grid { margin-top:16px; display:grid; grid-template-columns: repeat(auto-fill, minmax(160px,1fr)); gap:12px; }
+    .card { border:1px solid #e5e7eb; border-radius:8px; overflow:hidden; background:#fff; }
+    .thumb { display:block; width:100%; aspect-ratio:1/1; object-fit:cover; }
+    .meta { padding:8px; font-size:12px; color:#555; display:flex; justify-content:space-between; gap:8px; }
+    .topbar { display:flex; gap:12px; align-items:center; }
+    .muted { color:#777; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h2>圖片圖庫</h2>
+  <div class="topbar">
+    <div>
+      <label>API Key</label><br/>
+      <input id="apiKey" placeholder="輸入你給客戶的 API Key" style="width:240px" />
+    </div>
+    <div>
+      <label>日期 (YYYY-MM-DD)</label><br/>
+      <input id="date" placeholder="2025-09-11" />
+    </div>
+    <div>
+      <label>群組</label><br/>
+      <select id="group"></select>
+    </div>
+    <div style="align-self:flex-end;">
+      <button id="btnLoadGroups">載入群組</button>
+      <button id="btnLoadFiles">載入圖片</button>
+    </div>
+  </div>
+
+  <p class="muted">Bucket: {{ bucket }}　Base: {{ base_dir }}</p>
+
+  <div id="grid" class="grid"></div>
+
+  <script>
+    const $ = (sel) => document.querySelector(sel);
+    const api = (path, params={}) => {
+      const key = $("#apiKey").value.trim();
+      const url = new URL(path, window.location.origin);
+      for (const [k,v] of Object.entries(params)) url.searchParams.set(k, v);
+      if (key) url.searchParams.set("key", key);
+      return fetch(url.toString());
+    };
+
+    $("#btnLoadGroups").addEventListener("click", async () => {
+      const date = $("#date").value.trim();
+      if (!date) { alert("請輸入日期"); return; }
+      const r = await api("/api/groups", {date});
+      if (!r.ok) { alert("載入群組失敗：" + r.status); return; }
+      const j = await r.json();
+      const sel = $("#group");
+      sel.innerHTML = "";
+      j.groups.forEach(g => {
+        const o = document.createElement("option");
+        o.value = g; o.textContent = g;
+        sel.appendChild(o);
+      });
+      if (j.groups.length === 0) alert("找不到群組");
+    });
+
+    $("#btnLoadFiles").addEventListener("click", async () => {
+      const date = $("#date").value.trim();
+      const group = $("#group").value;
+      if (!date || !group) { alert("請先選日期與群組"); return; }
+      const r = await api("/api/files", {date, group});
+      if (!r.ok) { alert("載入圖片失敗：" + r.status); return; }
+      const j = await r.json();
+      const grid = $("#grid");
+      grid.innerHTML = "";
+      j.items.forEach(it => {
+        const card = document.createElement("div");
+        card.className = "card";
+        const a = document.createElement("a");
+        a.href = it.url; a.target = "_blank"; a.rel="noopener";
+        const img = document.createElement("img");
+        img.src = it.url; img.className = "thumb"; img.loading="lazy";
+        a.appendChild(img);
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.innerHTML = `<span>${it.name}</span><span>${(it.size/1024).toFixed(0)} KB</span>`;
+        card.appendChild(a); card.appendChild(meta);
+        grid.appendChild(card);
+      });
+      if (j.items.length === 0) alert("沒有圖片");
+    });
+  </script>
+</body>
+</html>
