@@ -341,7 +341,7 @@ def api_groups():
         return jsonify({"error": "GCS_BUCKET not configured"}), 500
 
     # NEW: 統一處理 BASE_DIR
-    date_prefix = _join_prefix(BASE_DIR, date)
+    date_prefix = f"{date}/"
 
     # 這裡列出「下一層資料夾」（群組）
     prefixes, _ = _list_prefixes_and_blobs(date_prefix)
