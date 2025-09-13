@@ -11,6 +11,8 @@ app = Flask(__name__)
 
 from flask import Flask, request, abort
 from google.cloud import storage
+from flask import Response, jsonify, request
+import json
 
 # v2：收訊息/抓內容/回覆
 from linebot import LineBotApi, WebhookHandler
@@ -363,38 +365,38 @@ def api_files():
     if not _auth_ok(request):
         return jsonify({"error": "unauthorized"}), 401
 
-    date = request.args.get("date")
-    group = request.args.get("group")
+    date = request.args.get("date")         # YYYY-MM-DD
+    group = request.args.get("group")       # 群組資料夾名（可含中文）
     if not date or not group:
         return jsonify({"error": "missing 'date' or 'group'"}), 400
     if not GCS_BUCKET:
         return jsonify({"error": "GCS_BUCKET not configured"}), 500
 
-    # 支援是否包含相簿子資料夾（若你有 album_xxx）
-    album = request.args.get("album", "")
-    base_prefix = f"{BASE_DIR}/{date}/{group}"
-    prefix = f"{base_prefix}/{album}" if album else base_prefix
+    # 你既有的 base dir 規則：date/group/...
+    base_prefix = f"{date}/{group}/".replace("//", "/")
 
-    _, files = _list_prefixes_and_blobs(prefix)
+    # 取出這個群組底下的 blob 清單（你原本就有的列舉函式）
+    _, blobs = _list_prefixes_and_blobs(base_prefix)
 
-    items = []
-    for b in files:
-        # b.name e.g. 'line-bot/2025-09-11/數學群組/001.jpg'
-        rel = b.name  # 就當作 bucket 內相對路徑
-        url = gcs_signed_url(rel, ttl_seconds=86400)  # 24h
-        items.append({
-            "name": os.path.basename(rel),
-            "path": rel,
-            "url": url,
-            "gs_uri": f"gs://{GCS_BUCKET}/{rel}",
-            "size": b.size,
-            "updated": b.updated.isoformat() if getattr(b, "updated", None) else None,
+    files = []
+    for b in blobs:
+        # b.name 例如：2025-09-12/某某群組/13:05:22_abc123.jpg
+        rel = b.name[len(f"{date}/"):]  # 去掉前面 date/ 只留 群組/檔名 或更深層
+        # 這裡你也可以只取檔名：rel.split("/", 1)[-1]
+        # 產出 1 小時有效的簽名網址
+        url = gcs_signed_url(b.name, ttl_seconds=3600)
+        files.append({
+            "path": b.name,        # GCS 內完整路徑
+            "rel": rel,            # 去掉 date/ 的相對路徑（含群組）
+            "name": rel.split("/")[-1],  # 檔名
+            "url": url             # 簽名 URL（1h）
         })
 
-    # 依檔名排序（有 001.jpg、002.jpg 會很順）
-    items.sort(key=lambda x: x["name"])
-    return jsonify({"date": date, "group": group, "count": len(items), "items": items})
-
+    # ✅ 確保中文群組 / 檔名不被 \uXXXX 轉義
+    return Response(
+        json.dumps(files, ensure_ascii=False),
+        mimetype="application/json"
+    )
 # 圖庫頁面
 @app.get("/gallery")
 def gallery():
