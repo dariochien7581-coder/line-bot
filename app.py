@@ -329,6 +329,9 @@ def _join_prefix(*parts: str) -> str:
     clean = [p.strip("/").strip() for p in parts if p and p.strip("/").strip()]
     return "/".join(clean)  # 不在尾端加斜線，交給 list 時使用 delimiter="/"
 
+from flask import Response
+import json
+
 @app.get("/api/groups")
 def api_groups():
     if not _auth_ok(request):
@@ -340,19 +343,20 @@ def api_groups():
     if not GCS_BUCKET:
         return jsonify({"error": "GCS_BUCKET not configured"}), 500
 
-    # NEW: 統一處理 BASE_DIR
-    date_prefix = f"{date}/"
-
-    # 這裡列出「下一層資料夾」（群組）
+    date_prefix = f"{date}"
     prefixes, _ = _list_prefixes_and_blobs(date_prefix)
+
     groups = []
     for p in prefixes:
-        # 例：'2025-09-12/數學群組/' -> ['2025-09-12','數學群組','']
         parts = p.rstrip("/").split("/")
         if len(parts) >= 2:
             groups.append(parts[-1])
 
-    return jsonify(groups)
+    # ✅ 確保中文正常顯示
+    return Response(
+        json.dumps(groups, ensure_ascii=False),
+        mimetype="application/json"
+    )
 
 @app.get("/api/files")
 def api_files():
