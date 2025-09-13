@@ -284,10 +284,24 @@ from flask import jsonify, render_template
 
 API_KEY = os.getenv("API_KEY", "")  # 在 Cloud Run 設定
 
+import hmac
+import os
+from flask import request
+
 def _auth_ok(req) -> bool:
-    # 允許用 Header：X-API-Key 或 query：?key=
-    k = req.headers.get("X-API-Key") or req.args.get("key")
-    return bool(API_KEY) and (k == API_KEY)
+    want = (os.getenv("API_KEY") or "").strip()
+    got = (req.args.get("apikey") or req.headers.get("X-API-KEY") or "").strip()
+
+    ok = bool(want) and hmac.compare_digest(got, want)
+
+    # 記錄必要線索（不輸出明文 key）
+    print(
+        f"[AUTH] ok={ok} got_len={len(got)} want_len={len(want)} "
+        f"got_tail={got[-4:] if got else ''} want_tail={want[-4:] if want else ''}",
+        flush=True
+    )
+    return ok
+
 
 def _list_prefixes_and_blobs(prefix: str):
     """回傳 (資料夾清單, 檔案清單)。使用 GCS delimiter 模擬資料夾。"""
