@@ -310,6 +310,11 @@ def _list_prefixes_and_blobs(prefix: str):
 
     return folders, files
 
+# 安全組 prefix: 若 BASE_DIR 為空就只用 date；有值就 BASE_DIR/date
+def _join_prefix(*parts: str) -> str:
+    clean = [p.strip("/").strip() for p in parts if p and p.strip("/").strip()]
+    return "/".join(clean)  # 不在尾端加斜線，交給 list 時使用 delimiter="/"
+
 @app.get("/api/groups")
 def api_groups():
     if not _auth_ok(request):
@@ -321,19 +326,19 @@ def api_groups():
     if not GCS_BUCKET:
         return jsonify({"error": "GCS_BUCKET not configured"}), 500
 
-    # 結構: BASE_DIR/<date>/<group>/...
-    date_prefix = f"{date}"   # 2025-09-12
-    folders, _ = _list_prefixes_and_blobs(date_prefix)
+    # NEW: 統一處理 BASE_DIR
+    date_prefix = _join_prefix(BASE_DIR, date)
 
+    # 這裡列出「下一層資料夾」（群組）
+    prefixes, _ = _list_prefixes_and_blobs(date_prefix)
     groups = []
-    for p in folders:
-        # p 例： 'line-bot/2025-09-11/數學群組/'
-        tail = p.rstrip("/").split("/")  # ['line-bot','2025-09-11','數學群組']
-        if len(tail) >= 3:
-            groups.append(tail[-1])
+    for p in prefixes:
+        # 例：'2025-09-12/數學群組/' -> ['2025-09-12','數學群組','']
+        parts = p.rstrip("/").split("/")
+        if len(parts) >= 2:
+            groups.append(parts[-1])
 
-    groups = sorted(set(groups))
-    return jsonify({"date": date, "groups": groups})
+    return jsonify(groups)
 
 @app.get("/api/files")
 def api_files():
